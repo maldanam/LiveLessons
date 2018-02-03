@@ -4,6 +4,7 @@ import utils.ConcurrentHashSet;
 import utils.FuturesCollector;
 import utils.Options;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
@@ -28,9 +29,15 @@ class ImageCounter {
         new ConcurrentHashSet<>();
 
     /**
+     * Stores a completed future with value of 0.
+     */
+    private CompletableFuture<Integer> mZero = 
+        CompletableFuture.completedFuture(0);
+
+    /**
      * Constructor counts all the images reachable from the root URI.
      */
-    public ImageCounter() {
+    ImageCounter() {
         // Get the URI to the root of the page/folder being traversed.
         String rootUri = Options.instance().getRootUri();
 
@@ -38,16 +45,32 @@ class ImageCounter {
         // is given an initial depth count of 1.
         countImages(rootUri, 1)
 
-        // When the future completes print the total number of images.
-        .thenAccept(totalImages ->
-                    print(TAG
-                          + ": there are "
-                          + totalImages
-                          + " total image(s) reachable from "
-                          + rootUri))
+            // Handle outcome of previous stage by converting any
+            // exceptions into 0 and printing the total # of images.
+            .handle((totalImages, ex) -> {
+                    if (totalImages == null)
+                        totalImages = 0;
+                    print(TAG + ": " + totalImages
+                          + " total image(s) are reachable from "
+                          + rootUri);
+                    return 0;
+                })
 
-        // join() blocks until all futures complete!
-        .join();                         
+            /*
+            // Handle any exception that occurred.
+            .exceptionally(ex -> 0) // Indicate no images were counted due to the exception.
+
+            // When the future completes print the total number of images.
+            .thenAccept(totalImages ->
+            print(TAG
+            + ": " 
+            + totalImages
+            + " total image(s) are reachable from "
+            + rootUri))
+            */
+
+            // join() blocks until all futures complete!
+            .join();
     }
 
     /**
@@ -60,35 +83,29 @@ class ImageCounter {
      */
     private CompletableFuture<Integer> countImages(String pageUri,
                                                    int depth) {
-        print(TAG
-              + ":>> Depth: " 
-              + depth 
-              + " [" 
-              + pageUri
-              + "]" 
-              + " (" 
-              + Thread.currentThread().getId() 
-              + ")");
-
         // Return 0 if we've reached the depth limit of the crawling.
         if (depth > Options.instance().maxDepth()) {
             print(TAG 
-                  + ": Exceeded max depth of "
+                  + "[Depth"
+                  + depth
+                  + "]: Exceeded max depth of "
                   + Options.instance().maxDepth());
 
-            return CompletableFuture.completedFuture(0);
+            return mZero;
         }
 
         // Atomically check to see if we've already visited this URL
         // and add the new url to the hashset so we don't try to
         // revisit it again unnecessarily.
         else if (!mUniqueUris.putIfAbsent(pageUri)) {
-            print(TAG + 
-                  ": Already processed " 
+            print(TAG 
+                  + "[Depth"
+                  + depth
+                  + "]: Already processed "
                   + pageUri);
 
             // Return 0 if we've already examined this url.
-            return CompletableFuture.completedFuture(0);
+            return mZero;
         }
 
         // Use completable futures to asynchronously (1) count the
@@ -96,7 +113,22 @@ class ImageCounter {
         // hyperlinks accessible via this page and count their images.
         else 
             return countImagesAsync(pageUri,
-                                    depth);
+                                    depth)
+                .whenComplete((totalImages, ex) -> {
+                        if (totalImages != null)
+                            print(TAG
+                                  + "[Depth"
+                                  + depth
+                                  + "]: found "
+                                  + totalImages
+                                  + " images for "
+                                  + pageUri
+                                  + " in thread " 
+                                  + Thread.currentThread().getId());
+                        else 
+                            print(TAG + ": exception " + ex.getMessage());
+                    });
+
     }
 
     /**
@@ -107,57 +139,36 @@ class ImageCounter {
      * @return A future to the number of images counted
      */
     private CompletableFuture<Integer> countImagesAsync(String pageUri,
-                                                     int depth) {
+                                                        int depth) {
         try {
-            // The following three lambdas are passed to the
-            // countImagesMapReduce() method below.
+            // Get a future to the page at the root URI.
+            CompletableFuture<Document> pageFuture = 
+                getStartPage(pageUri);
 
-            // This function asynchronously counts the number of
-            // images on this page and return a future to the count.
-            Function<Document, CompletableFuture<Integer>> imagesInPage =
-                page -> CompletableFuture
-                // Asynchronously get a collection of IMG SRC URLs in this page.
-                .supplyAsync(() ->
-                             // This method runs synchronously, so
-                             // call it via supplyAsync().
-                             getImagesOnPage(page))
-                // Asynchronously count the number of images on
-                // this page.
-                .thenApply(Elements::size);
+            // Asynchronously count the # of images on this page and
+            // return a future to the count.
+            CompletableFuture<Integer> imagesInPageFuture = pageFuture
+                // The getImagesOnPage() method runs synchronously, so
+                // call it via thenApplyAsync().
+                .thenApplyAsync(this::getImagesOnPage)
 
-            // A function that asynchronously counts # of images in
-            // links on this page and returns a future to the count.
-            Function<Document,
-                     CompletableFuture<List<Integer>>> imagesInLinks =
-                page -> CompletableFuture
-                .supplyAsync(() ->
-                             // This method runs synchronously, so
-                             // call it via supplyAsync().
-                             crawlLinksInPage(page,
-                                                   depth))
-                // When the future completes return its value to
-                // avoid an extra join.
-                .thenCompose(Function.identity());
+                // Count the number of images on this page.
+                .thenApply(List::size);
 
-            // Sum up the number of images encountered.
-            BiFunction<Integer, List<Integer>, Integer> sumCounts = (i, li) ->
-                i + li
-                // Convert list to a stream.
-                .stream()
-                    
-                // Convert each entry to an int.
-                .mapToInt(Integer::intValue)
+            // Asynchronously count the # of images in link on this
+            // page and returns a future to this count.
+            CompletableFuture<Integer> imagesInLinksFuture = pageFuture
+                // The crawlLinksInPage() methods runs synchronously,
+                // so thenComposeAsync() is used to avoid blocking via
+                // "flatMap()" semantics wrt nesting of futures.
+                .thenComposeAsync(page ->
+                                  crawlLinksInPage(page,
+                                                   depth));
 
-                // Sum all results in the list.
-                .sum();
-
-            // Asynchronously count the number of images on this page
-            // and (2) crawls other hyperlinks accessible via this
-            // page and counts their images.
-            return countImagesMapReduce(pageUri,
-                                        imagesInPage,
-                                        imagesInLinks,
-                                        sumCounts);
+            // Return a count of the # of images on this page plus the
+            // # of images on hyperlinks accessible via this page.
+            return combineImageCounts(imagesInPageFuture,
+                                      imagesInLinksFuture);
         } catch (Exception e) {
             print("For '" 
                   + pageUri 
@@ -169,50 +180,25 @@ class ImageCounter {
     }
 
     /**
-     * Asynchronously count the number of images on this page and
-     * crawl links accessible on this page to count their images.
+     * Asynchronously count of the # of images on this page plus the #
+     * of images on hyperlinks accessible via this page.
      *
-     * @param pageUri The URL that we're counting at this point
-     * @param imagesInPage A function that asynchronously counts the number of
-     *                     images on this page and return a future to the count
-     * @param imagesInLinks A function that asynchronously counts # of images in
-     *                      links on this page and returns a future to the count
-     * @param sumCounts A bifunction that sums up the number of images encountered
+     * @param imagesInPageFuture A future to a count of the # of
+     *                           images on this page
+     * @param imagesInLinksFuture A future to a count of the # of 
+     *                            images in links on this page
      * @return A future to the number of images counted
      */
-    private CompletableFuture<Integer> countImagesMapReduce
-        (String pageUri,
-         Function<Document, CompletableFuture<Integer>> imagesInPage,
-         Function<Document, CompletableFuture<List<Integer>>> imagesInLinks,
-         BiFunction<Integer, List<Integer>, Integer> sumCounts) {
-        // Get a future to the page at the root URI.
-        CompletableFuture<Document> pageFuture = 
-            getStartPage(pageUri);
+    private CompletableFuture<Integer> combineImageCounts
+        (CompletableFuture<Integer> imagesInPageFuture,
+         CompletableFuture<Integer> imagesInLinksFuture) {
 
-        // The following two asynchronous method calls run
-        // concurrently in the common fork-join pool.
-
-        // After contents of the document are obtained get a future to
-        // the number of images processed on this page.
-        CompletableFuture<Integer> imagesInPageFuture = pageFuture
-            // thenCompose() returns a completable future to
-            // the count of URLs in this page.
-            .thenCompose(imagesInPage);
-
-        // Obtain a future to the number of images processed
-        // on pages linked from this page.
-        CompletableFuture<List<Integer>> imagesInLinksFuture = pageFuture
-            // thenCompose() returns a completable future to
-            // the list of longs that count URLs on hyperlinks
-            // in this page.
-            .thenCompose(imagesInLinks);
-
-        // Return a completable future to the combined results
-        // of the two futures params whenever they complete.
+        // Return a completable future to the results of adding the
+        // two futures params after they both complete.
         return imagesInPageFuture
-            // When both futures complete combine/sum results.
+            // When both futures complete sum the results.
             .thenCombine(imagesInLinksFuture,
-                         sumCounts);
+                         Integer::sum);
     }
 
     /**
@@ -240,12 +226,13 @@ class ImageCounter {
     /**
      * Recursively crawl through hyperlinks that are in a @a page.
      *
-     * @return A completable future to an list of longs, which counts
-     * how many images were in each hyperlink on the page
+     * @param page The page containing HTML
+     * @param depth The depth of the level of web page traversal
+     * @return A completable future to an integer that counts how many
+     * images were in each hyperlink on the page
      */
-    private CompletableFuture<List<Integer>> crawlLinksInPage
-        (Document page,
-         int depth) {
+    private CompletableFuture<Integer> crawlLinksInPage(Document page,
+                                                        int depth) {
         // Return a completable future to a list of counts of the # of
         // nested hyperlinks in the page.
         return page
@@ -260,14 +247,23 @@ class ImageCounter {
             .map(hyperLink ->
                  // Recursively visit all the hyperlinks on this page.
                  countImages(Options
-                              .instance()
-                              .getJSuper()
-                              .getHyperLink(hyperLink),
-                              depth + 1))
+                             .instance()
+                             .getJSuper()
+                             .getHyperLink(hyperLink),
+                             depth + 1))
 
             // Trigger intermediate operation processing and return a
-            // list of completable futures.
-            .collect(FuturesCollector.toFuture());
+            // future to a list of completable futures.
+            .collect(FuturesCollector.toFuture())
+
+            // After all the futures in the list complete then sum all
+            // the integers in the list of results.
+            .thenApply(list -> list
+                       // Convert list to a stream.
+                       .stream()
+
+                       // Sum all results in the list.
+                       .reduce(0, Integer::sum));
     }
 
     /**
